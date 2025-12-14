@@ -46,15 +46,39 @@ def note_name_to_midi(note_name):
     # Clamp to MIDI range
     return max(0, min(127, midi_note))
 
+def write_events_to_track(track, event_list, channel):
+    """
+    Helper function to write a sorted list of events to a specific MIDI track.
+    Calculates delta times based on the specific event list.
+    """
+    last_tick_time = 0
+    
+    # Ensure events are sorted by time, then priority
+    event_list.sort(key=lambda x: (x['time'], x['priority']))
+
+    for event in event_list:
+        # Calculate Delta Time relative to THIS track's last event
+        delta_time = event['time'] - last_tick_time
+        if delta_time < 0: delta_time = 0
+        
+        if event['type'] == 'pitchwheel':
+            track.append(Message('pitchwheel', channel=channel, pitch=event['val'], time=delta_time))
+        elif event['type'] == 'note_on':
+            track.append(Message('note_on', channel=channel, note=event['note'], velocity=event['vel'], time=delta_time))
+        elif event['type'] == 'note_off':
+            track.append(Message('note_off', channel=channel, note=event['note'], velocity=event['vel'], time=delta_time))
+            
+        last_tick_time = event['time']
+
 def generate_24edo_sequencer(input_filename, output_filename):
     if not os.path.exists(input_filename):
         print(f"ERROR: Input file not found: {input_filename}")
         return
 
-    # 1. Read and Parse Data
-    # We need to store all events (Note On, Note Off, Pitch Bend) in a list
-    # Structure: (absolute_time_in_ticks, priority, msg_type, note, value)
-    all_events = []
+    # 1. Parsing
+    # We will split events into two lists immediately
+    clean_events = [] # For Channel 0 (No bend)
+    bent_events = []  # For Channel 1 (With bend)
     
     try:
         with open(input_filename, mode='r', newline='') as file:
@@ -67,29 +91,32 @@ def generate_24edo_sequencer(input_filename, output_filename):
                         raw_note = row[0].strip()
                         bend_val = int(row[1].strip())
                         velocity = int(round(float(row[2].strip()) * 127))
-                        duration_sec = float(row[3].strip()) # Duration is now seconds
+                        duration_sec = float(row[3].strip())
                         start_time_sec = float(row[4].strip())
                         
-                        # Convert data
                         midi_note = note_name_to_midi(raw_note)
                         start_ticks = int(start_time_sec * TICKS_PER_SECOND)
                         duration_ticks = int(duration_sec * TICKS_PER_SECOND)
                         end_ticks = start_ticks + duration_ticks
                         
-                        # Create Events
+                        # Determine which list and channel logic to use
+                        # If bend is NOT 0, it goes to the "Bent" track
+                        # If bend IS 0, it goes to the "Clean" track
+                        target_list = bent_events if bend_val != 0 else clean_events
                         
-                        # 1. Pitch Bend (Must happen just before Note On)
-                        # Priority 0: Happens first at this timestamp
-                        all_events.append({
-                            'time': start_ticks, 
-                            'priority': 0, 
-                            'type': 'pitchwheel', 
-                            'val': bend_val
-                        })
+                        # --- Create Events ---
                         
-                        # 2. Note On
-                        # Priority 1: Happens after bend
-                        all_events.append({
+                        # Only add pitch bend event if it is the bent track
+                        if bend_val != 0:
+                            target_list.append({
+                                'time': start_ticks, 
+                                'priority': 0, 
+                                'type': 'pitchwheel', 
+                                'val': bend_val
+                            })
+                        
+                        # Note On
+                        target_list.append({
                             'time': start_ticks, 
                             'priority': 1, 
                             'type': 'note_on', 
@@ -97,11 +124,10 @@ def generate_24edo_sequencer(input_filename, output_filename):
                             'vel': velocity
                         })
                         
-                        # 3. Note Off
-                        # Priority 2: Happens at end time
-                        all_events.append({
+                        # Note Off
+                        target_list.append({
                             'time': end_ticks, 
-                            'priority': 0, # Priority doesn't matter much here, but good to be consistent
+                            'priority': 0,
                             'type': 'note_off', 
                             'note': midi_note, 
                             'vel': 0
@@ -114,43 +140,43 @@ def generate_24edo_sequencer(input_filename, output_filename):
         print(f"File Error: {e}")
         return
 
-    if not all_events:
+    if not clean_events and not bent_events:
         print("No valid events found.")
         return
 
-    # 2. Sort Events
-    # Sort primarily by Time, secondarily by Priority (so Bends happen before Notes)
-    all_events.sort(key=lambda x: (x['time'], x['priority']))
+    # 2. Write to MIDI
+    # Type 1 = Multi-track synchronous
+    mid = MidiFile(type=1)
+    
+    # --- Track 1: Meta Data & Clean Notes (Channel 0) ---
+    track_clean = MidiTrack()
+    track_clean.name = "Standard Notes"
+    mid.tracks.append(track_clean)
+    
+    # Add Tempo/Meta to the first track
+    track_clean.append(MetaMessage('set_tempo', tempo=500000, time=0))
+    track_clean.append(Message('program_change', channel=0, program=0, time=0))
+    
+    # Write clean events to Channel 0
+    write_events_to_track(track_clean, clean_events, channel=0)
+    track_clean.append(MetaMessage('end_of_track', time=0))
 
-    # 3. Write to MIDI
-    mid = MidiFile(type=0)
-    track = MidiTrack()
-    mid.tracks.append(track)
-    
-    track.append(MetaMessage('set_tempo', tempo=500000, time=0))
-    track.append(Message('program_change', program=0, time=0))
-    
-    last_tick_time = 0
-    
-    for event in all_events:
-        # Calculate Delta Time (time since last event)
-        delta_time = event['time'] - last_tick_time
+    # --- Track 2: Bent Notes (Channel 1) ---
+    if bent_events:
+        track_bent = MidiTrack()
+        track_bent.name = "Microtonal Notes"
+        mid.tracks.append(track_bent)
         
-        # Ensure delta is non-negative (sorting should ensure this, but safety first)
-        if delta_time < 0: delta_time = 0
+        # Initialize Channel 1
+        track_bent.append(Message('program_change', channel=1, program=0, time=0))
         
-        if event['type'] == 'pitchwheel':
-            track.append(Message('pitchwheel', pitch=event['val'], time=delta_time))
-        elif event['type'] == 'note_on':
-            track.append(Message('note_on', note=event['note'], velocity=event['vel'], time=delta_time))
-        elif event['type'] == 'note_off':
-            track.append(Message('note_off', note=event['note'], velocity=event['vel'], time=delta_time))
-            
-        last_tick_time = event['time']
+        # Write bent events to Channel 1
+        write_events_to_track(track_bent, bent_events, channel=1)
+        track_bent.append(MetaMessage('end_of_track', time=0))
 
-    track.append(MetaMessage('end_of_track', time=0))
     mid.save(output_filename)
     print(f"Success! Saved to {output_filename}")
+    print(f"Stats: {len(clean_events)//2} standard notes, {len(bent_events)//3} bent notes.")
 
 # --- Execution ---
 if len(sys.argv) < 3:
@@ -160,10 +186,10 @@ if len(sys.argv) < 3:
     if not os.path.exists(dummy_csv):
         with open(dummy_csv, 'w') as f:
             f.write("Note_Name,Pitch_Bend,Time,Velocity,Duration\n")
-            f.write("C4,0,0.0,100,1.0\n")       # C4 at 0.0s for 1s
-            f.write("C4,2048,1.0,100,1.0\n")    # C4 quarter-sharp at 1.0s
-            f.write("E4,0,2.0,90,0.5\n")        # E4 at 2.0s
-            f.write("G4,0,2.5,90,0.5\n")        # G4 at 2.5s
+            f.write("C4,0,0.0,100,1.0\n")       # Clean Track
+            f.write("C4,2048,0.5,100,1.0\n")    # Bent Track (Overlap to test interference)
+            f.write("E4,0,2.0,90,0.5\n")        # Clean Track
+            f.write("G4,-2048,2.5,90,0.5\n")    # Bent Track
         print(f"Created demo input file: {dummy_csv}")
     sys.exit(1)
 
